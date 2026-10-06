@@ -102,11 +102,44 @@ const ratio = (a, b) => b ? a / b : null;
 const variance = r => 100 * (r.Actual_Hours / r.Budgeted_Hours - 1);
 const margin = r => 100 * r.Contribution_Margin_DKK / r.Revenue_DKK;
 const excess = r => Math.max(0, r.Actual_Hours - r.Budgeted_Hours);
+
+// Display-only decimal arithmetic. Scale the original numeric inputs into BigInt
+// units instead of trying to repair an already rounded binary sum with epsilon.
+// Raw metrics, comparisons, filtering and exports continue to use the code below.
+function decimalDisplay(rows) {
+  const parts = value => {
+    const [mantissa, exponent = '0'] = String(value).split('e');
+    return {units: BigInt(mantissa.replace('.', '')),
+      places: (mantissa.split('.')[1] || '').length - Number(exponent)};
+  };
+  const inputs = rows.flatMap(r => [r.Actual_Hours, r.Budgeted_Hours,
+    ...(r.Customer_Satisfaction_1_to_5 === null ? [] : [r.Customer_Satisfaction_1_to_5])]);
+  const places = Math.max(0, ...inputs.map(v => parts(v).places));
+  const scale = 10n ** BigInt(places);
+  const units = value => { const p = parts(value); return p.units * 10n ** BigInt(places - p.places); };
+  let extra = 0n, ratings = 0n, rated = 0n;
+  for (const r of rows) {
+    const delta = units(r.Actual_Hours) - units(r.Budgeted_Hours);
+    if (delta > 0n) extra += delta;
+    if (r.Customer_Satisfaction_1_to_5 !== null) { ratings += units(r.Customer_Satisfaction_1_to_5); rated++; }
+  }
+  const rounded = (total, count, digits) => {
+    if (!count) return null;
+    const factor = 10n ** BigInt(digits), denominator = scale * count;
+    const absolute = (total < 0n ? -total : total) * factor;
+    // Integer division with half-away-from-zero rounding, matching Intl halfExpand.
+    const result = (2n * absolute + denominator) / (2n * denominator);
+    return Number(total < 0n ? -result : result) / Number(factor);
+  };
+  return {excess: rounded(extra, 1n, 0), satisfaction: rounded(ratings, rated, 2)};
+}
+
 function summarize(rows) {
   const revenue = sum(rows, 'Revenue_DKK'), contribution = sum(rows, 'Contribution_Margin_DKK');
   const budget = sum(rows, 'Budgeted_Hours'), actual = sum(rows, 'Actual_Hours');
   const rated = rows.filter(r => r.Customer_Satisfaction_1_to_5 !== null);
   return { n: rows.length, revenue, contribution, margin: ratio(contribution * 100, revenue), budget, actual,
+    display: decimalDisplay(rows),
     variance: budget ? 100 * (actual / budget - 1) : null,
     excess: rows.reduce((s, r) => s + excess(r), 0),
     over: rows.filter(r => r.Actual_Hours > r.Budgeted_Hours).length,
@@ -163,8 +196,8 @@ function render() {
     ['Contribution',money(s.contribution),'Before unreported overhead','teal','DKK'],
     ['Contribution margin',pct(s.margin),'Contribution per DKK of revenue','teal','% OF REVENUE'],
     ['Over hour budget',pct(ratio(100*s.over,s.n)),`${s.over} of ${s.n} projects exceed hours`,'amber','PROJECT SHARE'],
-    ['Excess hours',num(s.excess,0),`${s.major} projects exceed hours by >20%`,'amber','HOURS'],
-    ['Satisfaction',s.satisfaction===null?'—':`${num(s.satisfaction,2)}<small> / 5</small>`,`${s.rated} rated / ${s.n} · ${pct(ratio(100*s.rated,s.n))} coverage`,'violet','RESPONDENTS']
+    ['Excess hours',num(s.display.excess,0),`${s.major} projects exceed hours by >20%`,'amber','HOURS'],
+    ['Satisfaction',s.satisfaction===null?'—':`${num(s.display.satisfaction,2)}<small> / 5</small>`,`${s.rated} rated / ${s.n} · ${pct(ratio(100*s.rated,s.n))} coverage`,'violet','RESPONDENTS']
   ].map(([label,value,note,color,unit])=>`<article class="kpi ${color}"><div class="kpi-top"><span>${label}</span><span class="kpi-dot"></span></div><strong>${value}</strong><span class="kpi-unit">${unit}</span><p>${note}</p></article>`).join('');
   const extra=['country','client','team','industry'].filter(id=>$(`filter-${id}`).value).length;
   $('more-filter-label').innerHTML=`More filters ${extra?`<span class="filter-count">${extra}</span>`:'<span>+</span>'}`;
@@ -186,7 +219,7 @@ function renderInsights(s) {
   const value=[...types].sort((a,b)=>b.contribution-a.contribution)[0];
   const eligible=clients.filter(g=>g.n>=5), low=[...eligible].sort((a,b)=>a.margin-b.margin)[0];
   const items=[
-    ['warning',s.excess?'DELIVERY RISK':'DELIVERY CHECK',s.excess?'Tighten scope & estimation':'No excess hours in this scope',s.excess?`<strong>${esc(effort.name)}</strong> accounts for <strong>${pct(ratio(100*effort.excess,s.excess))}</strong> of excess hours (${num(effort.excess)}h).`:'Every selected project is at or below its observed hour budget.',s.excess?'Review scope changes and estimation assumptions before adding delivery capacity.':'Check status and estimates to complete before treating unfinished work as a delivery benchmark.'],
+    ['warning',s.excess?'DELIVERY RISK':'DELIVERY CHECK',s.excess?'Tighten scope & estimation':'No excess hours in this scope',s.excess?`<strong>${esc(effort.name)}</strong> accounts for <strong>${pct(ratio(100*effort.excess,s.excess))}</strong> of excess hours (${num(effort.display.excess)}h).`:'Every selected project is at or below its observed hour budget.',s.excess?'Review scope changes and estimation assumptions before adding delivery capacity.':'Check status and estimates to complete before treating unfinished work as a delivery benchmark.'],
     ['opportunity','VALUE ENGINE','Protect what creates value',`<strong>${esc(value.name)}</strong> supplies <strong>${pct(ratio(100*value.contribution,s.contribution))}</strong> of contribution at a ${pct(value.margin)} margin.`, `Prioritize repeatable delivery and account development. Based on ${value.n} projects; validate demand before scaling.`],
     ['review','COMMERCIAL REVIEW',low?'Review account economics':'Keep the sample in view',low?`<strong>${esc(low.name)}</strong> has the lowest margin among accounts with ≥5 projects: <strong>${pct(low.margin)}</strong> (${low.n} projects).`:'No account in this scope has at least five projects.',low?'Review pricing, scope and service mix with the account owner before repricing.':'Use the project review list; small samples do not support reliable account rankings.']
   ];
@@ -203,11 +236,11 @@ function renderTypes() {
 function renderClients() {
   const sort=$('client-sort').value;
   const groups=group(selected,'Client').sort((a,b)=>sort==='margin'?a.margin-b.margin:b[sort]-a[sort]).slice(0,8);
-  $('client-chart').innerHTML=groups.length?`<table class="client-table"><thead><tr><th>Account</th><th>Contribution</th><th>CM %</th><th>Excess h</th></tr></thead><tbody>${groups.map(g=>`<tr><td><button class="client-link" data-client="${esc(g.name)}">${esc(g.name)}</button><small>${g.n} projects</small></td><td>${money(g.contribution)}</td><td><span class="margin-tag ${g.margin<40?'warning':''}">${pct(g.margin)}</span></td><td>${num(g.excess)}</td></tr>`).join('')}</tbody></table>`:empty();
+  $('client-chart').innerHTML=groups.length?`<table class="client-table"><thead><tr><th>Account</th><th>Contribution</th><th>CM %</th><th>Excess h</th></tr></thead><tbody>${groups.map(g=>`<tr><td><button class="client-link" data-client="${esc(g.name)}">${esc(g.name)}</button><small>${g.n} projects</small></td><td>${money(g.contribution)}</td><td><span class="margin-tag ${g.margin<40?'warning':''}">${pct(g.margin)}</span></td><td>${num(g.display.excess)}</td></tr>`).join('')}</tbody></table>`:empty();
   document.querySelectorAll('[data-client]').forEach(b=>b.onclick=()=>drill('Client',b.dataset.client));
   const first=groups[0],s=summarize(selected);
   $('client-takeaway').hidden=!first;
-  if(first)$('client-takeaway').innerHTML=sort==='contribution'?`<strong>Value and efficiency are different questions</strong>${esc(first.name)} is the largest contributor in this selection (${pct(ratio(100*first.contribution,s.contribution))} of contribution). Compare its ${pct(first.margin)} margin with the ${pct(s.margin)} portfolio margin before choosing where to grow.`:sort==='margin'?`<strong>Start with pricing, scope and service mix</strong>${esc(first.name)} is the lowest-margin selected account at ${pct(first.margin)} (${first.n} projects). A low account margin is a review signal; it does not show that the client caused the outcome.`:`<strong>Check where effort is accumulating</strong>${esc(first.name)} has ${num(first.excess)} excess hours across ${first.n} projects. Review scope changes and estimates; excess effort is not a monetary loss estimate.`;
+  if(first)$('client-takeaway').innerHTML=sort==='contribution'?`<strong>Value and efficiency are different questions</strong>${esc(first.name)} is the largest contributor in this selection (${pct(ratio(100*first.contribution,s.contribution))} of contribution). Compare its ${pct(first.margin)} margin with the ${pct(s.margin)} portfolio margin before choosing where to grow.`:sort==='margin'?`<strong>Start with pricing, scope and service mix</strong>${esc(first.name)} is the lowest-margin selected account at ${pct(first.margin)} (${first.n} projects). A low account margin is a review signal; it does not show that the client caused the outcome.`:`<strong>Check where effort is accumulating</strong>${esc(first.name)} has ${num(first.display.excess)} excess hours across ${first.n} projects. Review scope changes and estimates; excess effort is not a monetary loss estimate.`;
 }
 function renderCohorts() {
   if (!selected.length) { $('cohort-chart').innerHTML=empty(); return; }
@@ -225,9 +258,9 @@ function renderCohorts() {
 }
 function renderDelivery(s) {
   const deliveryGroups=cohorts(selected),within=deliveryGroups[0],high=deliveryGroups[2];
-  $('delivery-takeaway').innerHTML=within.n&&high.n?`<span class="takeaway-icon">${trendIcon}</span><div><strong>Excess effort deserves a management conversation.</strong><p>Projects >20% over hours show ${pct(high.margin)} contribution margin, compared with ${pct(within.margin)} within budget.${within.satisfaction!==null&&high.satisfaction!==null?` Respondent satisfaction is ${num(high.satisfaction,2)} vs ${num(within.satisfaction,2)} / 5.`:''} This is an association, not a proven causal effect.</p></div>`:`<span class="takeaway-icon">◎</span><div><strong>Read delivery outcomes in context.</strong><p>This selection does not contain both within-budget and >20% over-budget projects. Broaden the filters to compare cohorts; missing satisfaction remains unknown.</p></div>`;
+  $('delivery-takeaway').innerHTML=within.n&&high.n?`<span class="takeaway-icon">${trendIcon}</span><div><strong>Excess effort deserves a management conversation.</strong><p>Projects >20% over hours show ${pct(high.margin)} contribution margin, compared with ${pct(within.margin)} within budget.${within.satisfaction!==null&&high.satisfaction!==null?` Respondent satisfaction is ${num(high.display.satisfaction,2)} vs ${num(within.display.satisfaction,2)} / 5.`:''} This is an association, not a proven causal effect.</p></div>`:`<span class="takeaway-icon">◎</span><div><strong>Read delivery outcomes in context.</strong><p>This selection does not contain both within-budget and >20% over-budget projects. Broaden the filters to compare cohorts; missing satisfaction remains unknown.</p></div>`;
   const groups=group(selected,$('effort-group').value).sort((a,b)=>b.excess-a.excess),max=Math.max(...groups.map(g=>g.excess),1);
-  $('effort-chart').innerHTML=groups.length?groups.map(g=>`<div class="effort-row"><div><strong>${esc(g.name)}</strong><span>${num(g.excess)}h <small>· ${signed(g.variance)} net variance</small></span></div><div class="effort-track"><div style="width:${100*g.excess/max}%"></div></div></div>`).join(''):empty();
+  $('effort-chart').innerHTML=groups.length?groups.map(g=>`<div class="effort-row"><div><strong>${esc(g.name)}</strong><span>${num(g.display.excess)}h <small>· ${signed(g.variance)} net variance</small></span></div><div class="effort-track"><div style="width:${100*g.excess/max}%"></div></div></div>`).join(''):empty();
   $('effort-footer').textContent=`Portfolio net hour variance: ${signed(s.variance)}. ${num(s.actual,1)} actual / ${num(s.budget)} budgeted hours. Excess hours: ${num(s.excess,1)}.`;
   const rated=selected.filter(r=>r.Customer_Satisfaction_1_to_5!==null),corr=correlation(selected);
   $('correlation').textContent=corr===null?'r unavailable':`Pearson r = ${num(corr,2)}`;
@@ -243,7 +276,7 @@ function renderDelivery(s) {
     for(const r of rated)svg+=`<circle class="project-point" tabindex="0" role="button" aria-label="Inspect ${r.Project_ID}, ${esc(r.Client)}, ${signed(variance(r))} hour variance, ${r.Customer_Satisfaction_1_to_5} rating" data-project="${r.Project_ID}" cx="${x(variance(r))}" cy="${y(r.Customer_Satisfaction_1_to_5)}" r="4.2" fill="${variance(r)>20?'#cb9853':'#6d89d3'}" fill-opacity=".65"><title>${r.Project_ID} · ${esc(r.Client)} · ${signed(variance(r))} hours · ${r.Customer_Satisfaction_1_to_5}/5</title></circle>`;
     $('scatter-chart').innerHTML=svg+'</svg><div class="legend scatter-legend"><span class="legend-dot violet"></span>Within budget or ≤20% over <span class="legend-dot amber"></span>&gt;20% over hours</div>';bindProjects($('scatter-chart'));
   }
-  $('delivery-cohorts').innerHTML=cohorts(selected).map(g=>`<tr><td><strong>${g.name}</strong></td><td>${g.n}</td><td>${money(g.revenue)}</td><td>${pct(g.margin)}</td><td>${g.satisfaction===null?'—':`${num(g.satisfaction,2)} / 5`}</td><td>${g.rated} / ${g.n} <span class="muted">(${pct(ratio(100*g.rated,g.n))})</span></td></tr>`).join('');
+  $('delivery-cohorts').innerHTML=cohorts(selected).map(g=>`<tr><td><strong>${g.name}</strong></td><td>${g.n}</td><td>${money(g.revenue)}</td><td>${pct(g.margin)}</td><td>${g.satisfaction===null?'—':`${num(g.display.satisfaction,2)} / 5`}</td><td>${g.rated} / ${g.n} <span class="muted">(${pct(ratio(100*g.rated,g.n))})</span></td></tr>`).join('');
 }
 function reviewRows() {
   const query=$('project-search').value.trim().toLowerCase(),risk=$('risk-filter').value;
